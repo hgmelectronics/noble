@@ -19,6 +19,9 @@ using winrt::Windows::Storage::Streams::ByteOrder;
 using winrt::Windows::Security::Cryptography::CryptographicBuffer;
 using winrt::Windows::Devices::Bluetooth::Advertisement::BluetoothLEAdvertisementBytePattern;
 using winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::GattSession;
+using winrt::Windows::Devices::Enumeration::DevicePairingKinds;
+using winrt::Windows::Devices::Enumeration::DevicePairingProtectionLevel;
+using winrt::Windows::Devices::Enumeration::DevicePairingResultStatus;
 
 template <typename T> auto inFilter(std::vector<T> filter, T object)
 {
@@ -585,7 +588,7 @@ bool BLEManager::Read(const std::string& uuid, const winrt::guid& serviceUuid,
                 {
                     characteristic->ReadValueAsync(BluetoothCacheMode::Uncached)
                         .Completed(
-                            bind2(this, &BLEManager::OnRead, uuid, serviceId, characteristicId));
+                            bind2(this, &BLEManager::OnRead, uuid, serviceUuid, characteristicUuid));
                 }
                 else
                 {
@@ -598,15 +601,23 @@ bool BLEManager::Read(const std::string& uuid, const winrt::guid& serviceUuid,
 }
 
 void BLEManager::OnRead(IAsyncOperation<GattReadResult> asyncOp, AsyncStatus status,
-                        const std::string uuid, const std::string serviceId,
-                        const std::string characteristicId)
+                        const std::string uuid, const winrt::guid serviceUuid,
+                        const winrt::guid characteristicUuid)
 {
     auto result = asyncOp.GetResults();
+    std::string serviceId = toStr(serviceUuid);
+    std::string characteristicId = toStr(characteristicUuid);
 
     auto emit = [this, uuid, serviceId, characteristicId](const std::string& err) { 
         auto error = err + " while reading characteristic " + characteristicId;
         mEmit.Read(uuid, serviceId, characteristicId, Data(), false, error); 
     };
+
+    if (CheckPairingNeeded(asyncOp, status, uuid))
+    {
+        AttemptPairing(uuid, [=]() { Read(uuid, serviceUuid, characteristicUuid); }, emit);
+        return;
+    }
 
     CHECK_STATUS_AND_RESULT(status, result, emit);
 
@@ -643,7 +654,8 @@ bool BLEManager::Write(const std::string& uuid, const winrt::guid& serviceUuid,
                                                              : GattWriteOption::WriteWithResponse;
                     characteristic->WriteValueWithResultAsync(value, option)
                         .Completed(
-                            bind2(this, &BLEManager::OnWrite, uuid, serviceId, characteristicId));
+                            bind2(this, &BLEManager::OnWrite, uuid, serviceUuid,
+                                  characteristicUuid, data, withoutResponse));
                 }
                 else
                 {
@@ -656,9 +668,21 @@ bool BLEManager::Write(const std::string& uuid, const winrt::guid& serviceUuid,
 }
 
 void BLEManager::OnWrite(IAsyncOperation<GattWriteResult> asyncOp, AsyncStatus status,
-                         const std::string uuid, const std::string serviceId,
-                         const std::string characteristicId)
+                         const std::string uuid, const winrt::guid serviceUuid,
+                         const winrt::guid characteristicUuid, Data data, bool withoutResponse)
 {
+    auto result = asyncOp.GetResults();
+    std::string serviceId = toStr(serviceUuid);
+    std::string characteristicId = toStr(characteristicUuid);
+
+    if (CheckPairingNeeded(asyncOp, status, uuid))
+    {
+        AttemptPairing(
+            uuid, [=]() { Write(uuid, serviceUuid, characteristicUuid, data, withoutResponse); },
+            [=](std::string err) { mEmit.Write(uuid, serviceId, characteristicId, err); });
+        return;
+    }
+
     if (status == AsyncStatus::Completed)
     {
         mEmit.Write(uuid, serviceId, characteristicId);
@@ -714,7 +738,7 @@ bool BLEManager::Notify(const std::string& uuid, const winrt::guid& serviceUuid,
                         GetDescriptorValue(characteristic->CharacteristicProperties());
 
                     auto completed = bind2(this, &BLEManager::OnNotify, *characteristic, uuid,
-                                           serviceId, characteristicId, on);
+                                           serviceUuid, characteristicUuid, on);
                     characteristic
                         ->WriteClientCharacteristicConfigurationDescriptorWithResultAsync(
                             descriptorValue)
@@ -733,7 +757,7 @@ bool BLEManager::Notify(const std::string& uuid, const winrt::guid& serviceUuid,
                     auto descriptorValue =
                         GattClientCharacteristicConfigurationDescriptorValue::None;
                     auto completed = bind2(this, &BLEManager::OnNotify, *characteristic, uuid,
-                                           serviceId, characteristicId, on);
+                                           serviceUuid, characteristicUuid, on);
                     characteristic
                         ->WriteClientCharacteristicConfigurationDescriptorWithResultAsync(
                             descriptorValue)
@@ -753,9 +777,21 @@ bool BLEManager::Notify(const std::string& uuid, const winrt::guid& serviceUuid,
 
 void BLEManager::OnNotify(IAsyncOperation<GattWriteResult> asyncOp, AsyncStatus status,
                           const GattCharacteristic characteristic, const std::string uuid,
-                          const std::string serviceId, const std::string characteristicId,
+                          const winrt::guid serviceUuid, const winrt::guid characteristicUuid,
                           const bool state)
 {
+    auto result = asyncOp.GetResults();
+    std::string serviceId = toStr(serviceUuid);
+    std::string characteristicId = toStr(characteristicUuid);
+
+    if (CheckPairingNeeded(asyncOp, status, uuid))
+    {
+        AttemptPairing(
+            uuid, [=]() { Notify(uuid, serviceUuid, characteristicUuid, state); },
+            [=](std::string err) { mEmit.Notify(uuid, serviceId, characteristicId, state, err); });
+        return;
+    }
+
     if (status == AsyncStatus::Completed)
     {
         mEmit.Notify(uuid, serviceId, characteristicId, state);
@@ -846,8 +882,8 @@ bool BLEManager::ReadValue(const std::string& uuid, const winrt::guid& serviceUu
                 std::string descriptorId = toStr(descriptorUuid);
                 if (descriptor)
                 {
-                    auto completed = bind2(this, &BLEManager::OnReadValue, uuid, serviceId,
-                                           characteristicId, descriptorId);
+                    auto completed = bind2(this, &BLEManager::OnReadValue, uuid, serviceUuid,
+                                           characteristicUuid, descriptorUuid);
                     descriptor->ReadValueAsync(BluetoothCacheMode::Uncached).Completed(completed);
                 }
                 else
@@ -861,15 +897,26 @@ bool BLEManager::ReadValue(const std::string& uuid, const winrt::guid& serviceUu
 }
 
 void BLEManager::OnReadValue(IAsyncOperation<GattReadResult> asyncOp, AsyncStatus status,
-                             const std::string uuid, const std::string serviceId,
-                             const std::string characteristicId, const std::string descriptorId)
+                             const std::string uuid, winrt::guid serviceUuid,
+                             winrt::guid characteristicUuid, winrt::guid descriptorUuid)
 {
     auto result = asyncOp.GetResults();
+    std::string serviceId = toStr(serviceUuid);
+    std::string characteristicId = toStr(characteristicUuid);
+    std::string descriptorId = toStr(descriptorUuid);
 
     auto emit = [this, uuid, serviceId, characteristicId, descriptorId](const std::string& err) { 
         auto error = err + " while reading value of descriptor " + descriptorId;
         mEmit.ReadValue(uuid, serviceId, characteristicId, descriptorId, Data(), error); 
     };
+
+    if (CheckPairingNeeded(asyncOp, status, uuid))
+    {
+        AttemptPairing(
+            uuid, [=]() { ReadValue(uuid, serviceUuid, characteristicUuid, descriptorUuid); },
+            emit);
+        return;
+    }
 
     CHECK_STATUS_AND_RESULT(status, result, emit);
 
@@ -903,8 +950,8 @@ bool BLEManager::WriteValue(const std::string& uuid, const winrt::guid& serviceU
                 writer.WriteBytes(data);
                 auto value = writer.DetachBuffer();
                 auto asyncOp = descriptor->WriteValueWithResultAsync(value);
-                asyncOp.Completed(bind2(this, &BLEManager::OnWriteValue, uuid, serviceId,
-                                        characteristicId, descriptorId));
+                asyncOp.Completed(bind2(this, &BLEManager::OnWriteValue, uuid, serviceUuid,
+                                        characteristicUuid, descriptorUuid, data));
             }
             else
             {
@@ -918,9 +965,23 @@ bool BLEManager::WriteValue(const std::string& uuid, const winrt::guid& serviceU
 }
 
 void BLEManager::OnWriteValue(IAsyncOperation<GattWriteResult> asyncOp, AsyncStatus status,
-                              const std::string uuid, const std::string serviceId,
-                              const std::string characteristicId, const std::string descriptorId)
+                              const std::string uuid, winrt::guid serviceUuid,
+                              winrt::guid characteristicUuid, winrt::guid descriptorUuid, Data data)
 {
+    std::string serviceId = toStr(serviceUuid);
+    std::string characteristicId = toStr(characteristicUuid);
+    std::string descriptorId = toStr(descriptorUuid);
+
+    if (CheckPairingNeeded(asyncOp, status, uuid))
+    {
+        AttemptPairing(
+            uuid,
+            [=]() { WriteValue(uuid, serviceUuid, characteristicUuid, descriptorUuid, data); },
+            [=](std::string err)
+            { mEmit.WriteValue(uuid, serviceId, characteristicId, descriptorId, err); });
+        return;
+    }
+
     if (status == AsyncStatus::Completed)
     {
         mEmit.WriteValue(uuid, serviceId, characteristicId, descriptorId);
@@ -989,4 +1050,105 @@ void BLEManager::OnWriteHandle(IAsyncOperation<GattWriteResult> asyncOp, AsyncSt
         std::string error = "status: " + std::to_string((int)status);
         mEmit.WriteHandle(uuid, handle, error);
     }
+}
+
+void BLEManager::AttemptPairing(const std::string& uuid, std::function<void()> retry,
+                                std::function<void(std::string)> error)
+{
+    // fetch the peripheral and its information; re-validate here just in case,
+    // though it was already checked in CheckPairingNeededGatt()
+    PeripheralWinrt& peripheral = mDeviceMap[uuid];
+    if (!peripheral.device.has_value())
+    {
+        error("device not connected during pairing attempt");
+        return;
+    }
+
+    auto deviceInformation = peripheral.device->DeviceInformation();
+    if (deviceInformation.Pairing().IsPaired())
+    {
+        error("access denied (device already paired)");
+        return;
+    }
+
+    bool pairingInProgress = (mPendingOps.find(uuid) != mPendingOps.end());
+    mPendingOps[uuid].push_back({retry, error});
+
+    if (!pairingInProgress)
+    {
+        auto customPairing = deviceInformation.Pairing().Custom();
+        customPairing.PairingRequested(bind2(this, &BLEManager::OnPairingRequested));
+        customPairing
+            .PairAsync(DevicePairingKinds::ConfirmOnly, DevicePairingProtectionLevel::Encryption)
+            .Completed(bind2(this, &BLEManager::OnPairingCompleted, uuid));
+    }
+}
+
+void BLEManager::OnPairingRequested(
+    winrt::Windows::Devices::Enumeration::DeviceInformationCustomPairing sender,
+    winrt::Windows::Devices::Enumeration::DevicePairingRequestedEventArgs args)
+{
+    args.Accept();
+}
+
+void BLEManager::OnPairingCompleted(
+    IAsyncOperation<winrt::Windows::Devices::Enumeration::DevicePairingResult> asyncOp,
+    AsyncStatus status, std::string uuid)
+{
+    // grab the pending operations vector if one exists
+    auto it = mPendingOps.find(uuid);
+    if (it == mPendingOps.end())
+    {
+        return;
+    }
+    auto ops = std::move(it->second);
+    mPendingOps.erase(it);
+
+    // determine if pairing succeeded or failed, and create the error message
+    std::string error;
+    if (status == AsyncStatus::Completed)
+    {
+        auto result = asyncOp.GetResults();
+        if (result.Status() != DevicePairingResultStatus::Paired &&
+            result.Status() != DevicePairingResultStatus::AlreadyPaired)
+        {
+            error = "pairing failed status " + std::to_string((int)result.Status());
+        }
+    }
+    else
+    {
+        error = "pairing operation failed";
+    }
+
+    // fire retry on, or provide the error to, each pending operation in the vector
+    for (auto& op : ops)
+    {
+        if (error.empty())
+        {
+            op.retry();
+        }
+        else
+        {
+            op.error(error);
+        }
+    }
+}
+
+bool BLEManager::CheckPairingNeededGatt(GattCommunicationStatus asyncResult, const std::string uuid)
+{
+    if (asyncResult != GattCommunicationStatus::ProtocolError &&
+        asyncResult != GattCommunicationStatus::AccessDenied)
+    {
+        return false;
+    }
+    PeripheralWinrt& peripheral = mDeviceMap[uuid];
+    if (peripheral.device.has_value())
+    {
+        auto deviceInformation = peripheral.device->DeviceInformation();
+        if (!deviceInformation.Pairing().IsPaired())
+        {
+            return true;
+        }
+    }
+    return false;
 }
